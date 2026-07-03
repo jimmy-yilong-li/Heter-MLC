@@ -4,7 +4,7 @@
 
 # Heter-MLC
 
-Heter-MLC is a small patch set for **MLC-LLM + TVM** that makes
+Heter-MLC is a development for **MLC-LLM + TVM** that makes
 prefill/decode (PD) split serving reproducible inside the MLC serving engine.
 
 The core idea is simple: an external producer, such as CoreML/ANE on Apple
