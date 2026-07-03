@@ -1,0 +1,553 @@
+diff --git a/cpp/serve/data.cc b/cpp/serve/data.cc
+index 5f198691..9ca89215 100644
+--- a/cpp/serve/data.cc
++++ b/cpp/serve/data.cc
+@@ -7,6 +7,8 @@
+ #include <tvm/ffi/function.h>
+ #include <tvm/ffi/reflection/registry.h>
+ 
++#include <limits>
++
+ #include "model.h"
+ 
+ namespace mlc {
+@@ -18,6 +20,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+   TextDataNode::RegisterReflection();
+   TokenDataNode::RegisterReflection();
+   ImageDataNode::RegisterReflection();
++  ExternalKVDataNode::RegisterReflection();
+   RequestStreamOutputObj::RegisterReflection();
+ }
+ 
+@@ -145,6 +148,71 @@ TVM_FFI_STATIC_INIT_BLOCK() {
+       .def("mlc.serve.ImageDataGetImage", [](ImageData data) { return data->image; });
+ }
+ 
++/****************** ExternalKVData ******************/
++
++ExternalKVData::ExternalKVData(Tensor k_data, Tensor v_data, int prefill_length,
++                               Shape decode_token_ids) {
++  TVM_FFI_ICHECK(k_data.defined()) << "ExternalKVData expects defined K tensor.";
++  TVM_FFI_ICHECK(v_data.defined()) << "ExternalKVData expects defined V tensor.";
++  TVM_FFI_ICHECK_EQ(k_data->ndim, 4)
++      << "ExternalKVData expects K layout (num_layers, prefill_length, num_kv_heads, head_dim).";
++  TVM_FFI_ICHECK_EQ(v_data->ndim, 4)
++      << "ExternalKVData expects V layout (num_layers, prefill_length, num_kv_heads, head_dim).";
++  TVM_FFI_ICHECK_GT(prefill_length, 0);
++  TVM_FFI_ICHECK_EQ(k_data->shape[1], prefill_length);
++  TVM_FFI_ICHECK_EQ(v_data->shape[1], prefill_length);
++  TVM_FFI_ICHECK_EQ(k_data->shape[0], v_data->shape[0])
++      << "ExternalKVData expects K and V to have the same number of layers.";
++  TVM_FFI_ICHECK_EQ(k_data->shape[2], v_data->shape[2])
++      << "ExternalKVData expects K and V to have the same number of KV heads.";
++  TVM_FFI_ICHECK_EQ(k_data->shape[3], v_data->shape[3])
++      << "ExternalKVData expects K and V to have the same head dimension.";
++  TVM_FFI_ICHECK(k_data.DataType() == v_data.DataType())
++      << "ExternalKVData expects K and V to have the same dtype.";
++  TVM_FFI_ICHECK_GT(decode_token_ids.size(), 0)
++      << "ExternalKVData expects at least one decode token id.";
++  for (int64_t token_id : decode_token_ids) {
++    TVM_FFI_ICHECK_GE(token_id, std::numeric_limits<int32_t>::min());
++    TVM_FFI_ICHECK_LE(token_id, std::numeric_limits<int32_t>::max());
++  }
++
++  ObjectPtr<ExternalKVDataNode> n = tvm::ffi::make_object<ExternalKVDataNode>();
++  n->k_data = std::move(k_data);
++  n->v_data = std::move(v_data);
++  n->prefill_length = prefill_length;
++  n->decode_token_ids = std::move(decode_token_ids);
++  data_ = std::move(n);
++}
++
++int ExternalKVDataNode::GetLength() const { return prefill_length; }
++
++ObjectRef ExternalKVDataNode::GetEmbedding(Model model, ObjectRef* dst, int offset) const {
++  LOG(FATAL) << "\"GetEmbedding\" for ExternalKVData is not supported. "
++                "External K/V must be consumed by the PD external-KV engine action.";
++}
++
++TVM_FFI_STATIC_INIT_BLOCK() {
++  namespace refl = tvm::ffi::reflection;
++  refl::GlobalDef()
++      .def_packed("mlc.serve.ExternalKVData",
++                  [](ffi::PackedArgs args, ffi::Any* rv) {
++                    TVM_FFI_ICHECK_GE(args.size(), 4)
++                        << "ExternalKVData expects k, v, prefill_length, and decode tokens.";
++                    std::vector<int64_t> decode_token_ids;
++                    decode_token_ids.reserve(args.size() - 3);
++                    for (int i = 3; i < args.size(); ++i) {
++                      decode_token_ids.push_back(args[i].cast<int64_t>());
++                    }
++                    *rv = ExternalKVData(args[0].cast<Tensor>(), args[1].cast<Tensor>(),
++                                         args[2].cast<int>(),
++                                         Shape(decode_token_ids.begin(), decode_token_ids.end()));
++                  })
++      .def("mlc.serve.ExternalKVDataGetK", [](ExternalKVData data) { return data->k_data; })
++      .def("mlc.serve.ExternalKVDataGetV", [](ExternalKVData data) { return data->v_data; })
++      .def("mlc.serve.ExternalKVDataGetDecodeTokenIds",
++           [](ExternalKVData data) { return data->decode_token_ids; });
++}
++
+ /****************** SampleResult ******************/
+ 
+ /*! \brief Convert a single token with probability to JSON string. */
+diff --git a/cpp/serve/data.h b/cpp/serve/data.h
+index 9105bfb1..ce2a197c 100644
+--- a/cpp/serve/data.h
++++ b/cpp/serve/data.h
+@@ -60,7 +60,7 @@ class DataNode : public Object {
+ 
+   static constexpr const bool _type_has_method_sequal_reduce = false;
+   static constexpr const bool _type_has_method_shash_reduce = false;
+-  static constexpr const uint32_t _type_child_slots = 3;
++  static constexpr const uint32_t _type_child_slots = 4;
+   TVM_FFI_DECLARE_OBJECT_INFO("mlc.serve.Data", DataNode, Object);
+ };
+ 
+@@ -154,6 +154,61 @@ class ImageData : public Data {
+   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ImageData, Data, ImageDataNode);
+ };
+ 
++/****************** ExternalKVDataNode ******************/
++
++/*!
++ * \brief Externally produced K/V data for PD-split cache injection.
++ *
++ * The producer must emit tensors in the same convention consumed by Model::DebugSetKV.
++ * For kNormal RoPE models, K must already be rotary-applied at absolute positions
++ * [0, prefill_length); V is always raw. This path is currently intended for plain-MHA
++ * models; sliding-window and MLA models are not supported by the injection runtime.
++ */
++class ExternalKVDataNode : public DataNode {
++ public:
++  /*! \brief K data in layout (num_layers, prefill_length, num_kv_heads, head_dim). */
++  Tensor k_data;
++  /*! \brief V data in layout (num_layers, prefill_length, num_kv_heads, head_dim). */
++  Tensor v_data;
++  /*! \brief Number of externally-prefilled tokens represented by K/V. */
++  int prefill_length;
++  /*! \brief Already sampled token ids to feed into the first engine-driven decode step. */
++  Shape decode_token_ids;
++
++  int GetLength() const final;
++  ObjectRef GetEmbedding(Model model, ObjectRef* dst = nullptr, int offset = 0) const final;
++
++  static void RegisterReflection() {
++    namespace refl = tvm::ffi::reflection;
++    refl::ObjectDef<ExternalKVDataNode>();
++  }
++
++  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("mlc.serve.ExternalKVData", ExternalKVDataNode, DataNode);
++};
++
++class ExternalKVData : public Data {
++ public:
++  explicit ExternalKVData(Tensor k_data, Tensor v_data, int prefill_length, Shape decode_token_ids);
++
++  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ExternalKVData, Data, ExternalKVDataNode);
++};
++
++inline bool ContainsExternalKVData(const Array<Data>& inputs) {
++  for (const Data& input : inputs) {
++    if (input.as<ExternalKVDataNode>() != nullptr) {
++      return true;
++    }
++  }
++  return false;
++}
++
++inline const ExternalKVDataNode* GetSoleExternalKVData(const Array<Data>& inputs) {
++  if (inputs.size() != 1) {
++    return nullptr;
++  }
++  return inputs[0].as<ExternalKVDataNode>();
++}
++
+ /****************** SampleResult ******************/
+ 
+ // The pair of a token id and its probability in sampling.
+diff --git a/cpp/serve/engine.cc b/cpp/serve/engine.cc
+index 2d8f3890..7a8cc81b 100644
+--- a/cpp/serve/engine.cc
++++ b/cpp/serve/engine.cc
+@@ -16,6 +16,7 @@
+ 
+ #include <cstdlib>
+ #include <functional>
++#include <limits>
+ #include <numeric>
+ #include <optional>
+ #include <tuple>
+@@ -680,6 +681,43 @@ class EngineImpl : public Engine {
+     request = Request::FromUntokenized(request, tokenizer_);
+     TVM_FFI_ICHECK_NE(request->prompt_tokens, -1);
+ 
++    if (ContainsExternalKVData(request->inputs)) {
++      const ExternalKVDataNode* external_kv = GetSoleExternalKVData(request->inputs);
++      TVM_FFI_ICHECK(external_kv != nullptr)
++          << "ExternalKVData requests must contain exactly one input: ExternalKVData.";
++      TVM_FFI_ICHECK_EQ(request->generation_cfg->n, 1)
++          << "ExternalKVData requests currently support n=1 only.";
++      TVM_FFI_ICHECK(request->generation_cfg->debug_config.disagg_config.kind ==
++                     DisaggRequestKind::kNone)
++          << "ExternalKVData requests are served by the normal engine action, not MLC "
++             "disaggregation debug requests.";
++      TVM_FFI_ICHECK_EQ(models_.size(), 1U)
++          << "ExternalKVData requests currently support a single decode model only.";
++      ModelMetadata model_metadata = models_[0]->GetMetadata();
++      TVM_FFI_ICHECK(model_metadata.kv_state_kind == KVStateKind::kKVCache)
++          << "ExternalKVData requests currently support PagedKVCache models only.";
++      const ModelMetadata::KVCacheMetadata& kv_metadata = model_metadata.kv_cache_metadata;
++      TVM_FFI_ICHECK_EQ(external_kv->k_data->shape[0], kv_metadata.num_hidden_layers);
++      TVM_FFI_ICHECK_EQ(external_kv->v_data->shape[0], kv_metadata.num_hidden_layers);
++      TVM_FFI_ICHECK_EQ(external_kv->k_data->shape[2], kv_metadata.num_key_value_heads);
++      TVM_FFI_ICHECK_EQ(external_kv->v_data->shape[2], kv_metadata.num_key_value_heads);
++      TVM_FFI_ICHECK_EQ(external_kv->k_data->shape[3], kv_metadata.head_dim);
++      TVM_FFI_ICHECK_EQ(external_kv->v_data->shape[3], kv_metadata.head_dim);
++      TVM_FFI_ICHECK(external_kv->k_data.DataType() == external_kv->v_data.DataType())
++          << "ExternalKVData K and V tensors must use the same dtype.";
++      for (int64_t token_id : external_kv->decode_token_ids) {
++        TVM_FFI_ICHECK_GE(token_id, std::numeric_limits<int32_t>::min());
++        TVM_FFI_ICHECK_LE(token_id, std::numeric_limits<int32_t>::max());
++      }
++      TVM_FFI_ICHECK(engine_config_->prefix_cache_mode == PrefixCacheMode::kDisable)
++          << "ExternalKVData requests require prefix_cache_mode=\"disable\" because the engine "
++             "does not have prompt token ids to register in the prefix cache.";
++      TVM_FFI_ICHECK_LE(
++          external_kv->prefill_length + static_cast<int64_t>(external_kv->decode_token_ids.size()),
++          engine_config_->max_total_sequence_length)
++          << "ExternalKVData prefill plus seed decode tokens exceed max_total_sequence_length.";
++    }
++
+     if (request->prompt_tokens >= engine_config_->max_single_sequence_length &&
+         estate_->request_stream_callback_ != nullptr) {
+       this->StreamBackError(request, "length");
+diff --git a/cpp/serve/engine_actions/action.h b/cpp/serve/engine_actions/action.h
+index e3229933..9d890de3 100644
+--- a/cpp/serve/engine_actions/action.h
++++ b/cpp/serve/engine_actions/action.h
+@@ -95,6 +95,18 @@ class EngineAction : public ObjectRef {
+       DraftTokenWorkspaceManager draft_token_workspace_manager, EngineConfig engine_config,
+       std::vector<tvm::ffi::json::Object> model_configs,
+       Optional<EventTraceRecorder> trace_recorder);
++
++  /*!
++   * \brief Create the action that injects externally-produced K/V into the paged cache and seeds
++   * decode for PD split.
++   * \param models The models whose KV cache receives the external K/V.
++   * \param engine_config The engine config.
++   * \param trace_recorder The event trace recorder for requests.
++   * \return The created action object.
++   */
++  static EngineAction PDExternalKVPrefill(Array<Model> models, EngineConfig engine_config,
++                                          Optional<EventTraceRecorder> trace_recorder);
++
+   /*!
+    * \brief Create the action that runs one-step decode for requests in the
+    * `running_queue` of engine state. Preempt low-priority requests
+diff --git a/cpp/serve/engine_actions/action_commons.cc b/cpp/serve/engine_actions/action_commons.cc
+index 31523b37..b3502211 100644
+--- a/cpp/serve/engine_actions/action_commons.cc
++++ b/cpp/serve/engine_actions/action_commons.cc
+@@ -122,6 +122,10 @@ Array<EngineAction> CreateEngineActions(Array<Model> models, EngineConfig engine
+                EngineAction::BatchJumpForward(models, tokenizer, trace_recorder),
+                EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler, engine_config,
+                                          trace_recorder)};
++    if (models.size() == 1U && model_metadata.kv_state_kind == KVStateKind::kKVCache) {
++      actions.insert(actions.begin(),
++                     EngineAction::PDExternalKVPrefill(models, engine_config, trace_recorder));
++    }
+   }
+ 
+   if (model_metadata.disaggregation) {
+diff --git a/cpp/serve/engine_actions/batch_prefill_base.cc b/cpp/serve/engine_actions/batch_prefill_base.cc
+index d657ec41..c7948bad 100644
+--- a/cpp/serve/engine_actions/batch_prefill_base.cc
++++ b/cpp/serve/engine_actions/batch_prefill_base.cc
+@@ -100,8 +100,14 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
+       if (request->generation_cfg->debug_config.disagg_config.kind != DisaggRequestKind::kNone) {
+         continue;
+       }
+-      RequestState rstate = estate->GetRequestState(request);
+       bool prefill_stops = false;
++      if (ContainsExternalKVData(request->inputs)) {
++        // PDExternalKVPrefill only serves an ExternalKVData request when it reaches the front of
++        // the waiting queue. Stop here instead of skipping over it, otherwise normal prefill could
++        // reorder later requests ahead of the external-KV request and starve the PD action.
++        break;
++      }
++      RequestState rstate = estate->GetRequestState(request);
+       for (const RequestStateEntry& rsentry : rstate->entries) {
+         // A request state entry can be prefilled only when:
+         // - it has inputs, and
+diff --git a/cpp/serve/request.cc b/cpp/serve/request.cc
+index 21296136..b18985cb 100644
+--- a/cpp/serve/request.cc
++++ b/cpp/serve/request.cc
+@@ -30,6 +30,8 @@ Request::Request(String id, Array<Data> inputs, GenerationConfig generation_cfg)
+       prompt_tokens += token_data->token_ids.size();
+     } else if (const auto* image_data = input.as<ImageDataNode>()) {
+       prompt_tokens += image_data->GetLength();
++    } else if (const auto* external_kv_data = input.as<ExternalKVDataNode>()) {
++      prompt_tokens += external_kv_data->GetLength();
+     } else {
+       prompt_tokens = -1;
+       break;
+diff --git a/python/mlc_llm/serve/__init__.py b/python/mlc_llm/serve/__init__.py
+index fc1e81f6..16fa8737 100644
+--- a/python/mlc_llm/serve/__init__.py
++++ b/python/mlc_llm/serve/__init__.py
+@@ -3,7 +3,7 @@
+ # Load MLC LLM library by importing base
+ from .. import base
+ from .config import EngineConfig
+-from .data import Data, ImageData, RequestStreamOutput, TextData, TokenData
++from .data import Data, ExternalKVData, ImageData, RequestStreamOutput, TextData, TokenData
+ from .embedding_engine import AsyncEmbeddingEngine
+ from .engine import AsyncMLCEngine, MLCEngine
+ from .radix_tree import PagedRadixTree
+diff --git a/python/mlc_llm/serve/data.py b/python/mlc_llm/serve/data.py
+index e1bc4a75..0bc56ff8 100644
+--- a/python/mlc_llm/serve/data.py
++++ b/python/mlc_llm/serve/data.py
+@@ -129,6 +129,58 @@ class ImageData(Data):
+         return image_size
+ 
+ 
++@tvm_ffi.register_object("mlc.serve.ExternalKVData")
++class ExternalKVData(Data):
++    """External K/V tensors for PD-split injection.
++
++    ExternalKVData must be submitted as the sole request input to an engine
++    configured with ``prefix_cache_mode="disable"``.
++
++    The tensors must already follow the MLC paged-KV cache convention consumed
++    by ``Model::DebugSetKV``. For kNormal RoPE text models, ``k_data`` must be
++    post-RoPE K at absolute positions ``[0, prefill_length)``. ``v_data`` is
++    always raw V. The current engine path is intended for plain-MHA models;
++    sliding-window and MLA models are not supported by the injection runtime.
++
++    Parameters
++    ----------
++    k_data : tvm.runtime.Tensor
++        K tensor in layout (num_layers, prefill_length, num_kv_heads, head_dim).
++    v_data : tvm.runtime.Tensor
++        V tensor in layout (num_layers, prefill_length, num_kv_heads, head_dim).
++    prefill_length : int
++        Number of prompt tokens already represented in K/V.
++    decode_token_ids : List[int]
++        Token ids to seed the first engine-driven decode step.
++    """
++
++    def __init__(
++        self,
++        k_data: Tensor,
++        v_data: Tensor,
++        prefill_length: int,
++        decode_token_ids: List[int],  # noqa: UP006
++    ):
++        self.__init_handle_by_constructor__(
++            _ffi_api.ExternalKVData, k_data, v_data, prefill_length, *decode_token_ids
++        )
++
++    @property
++    def k_data(self) -> Tensor:
++        """Return the K tensor."""
++        return _ffi_api.ExternalKVDataGetK(self)
++
++    @property
++    def v_data(self) -> Tensor:
++        """Return the V tensor."""
++        return _ffi_api.ExternalKVDataGetV(self)
++
++    @property
++    def decode_token_ids(self) -> List[int]:  # noqa: UP006
++        """Return the seed decode token ids."""
++        return list(_ffi_api.ExternalKVDataGetDecodeTokenIds(self))
++
++
+ @dataclass
+ class SingleRequestStreamOutput:
+     """The request stream output of a single request.
+diff --git a/cpp/serve/engine_actions/pd_external_kv.cc b/cpp/serve/engine_actions/pd_external_kv.cc
+new file mode 100644
+index 00000000..db0b7f12
+--- /dev/null
++++ b/cpp/serve/engine_actions/pd_external_kv.cc
+@@ -0,0 +1,176 @@
++/*!
++ *  Copyright (c) 2023-2025 by Contributors
++ * \file serve/engine_actions/pd_external_kv.cc
++ */
++
++#include <tvm/support/cuda/nvtx.h>
++
++#include <algorithm>
++#include <chrono>
++#include <limits>
++
++#include "../data.h"
++#include "../metrics.h"
++#include "action.h"
++
++namespace mlc {
++namespace llm {
++namespace serve {
++
++using tvm::support::NVTXScopedRange;
++
++/*!
++ * \brief Inject externally produced K/V for a pending request, then seed the existing decode path.
++ *
++ * This action intentionally keeps producer logic out of C++. Python can run CoreML/ANE or any
++ * other producer and submit backend-neutral ExternalKVData. The action only reserves KV pages,
++ * calls Model::DebugSetKV, commits seed decode token(s), and lets BatchDecode do logits/sampling.
++ */
++class PDExternalKVPrefillActionObj : public EngineActionObj {
++ public:
++  explicit PDExternalKVPrefillActionObj(Array<Model> models, EngineConfig engine_config,
++                                        Optional<EventTraceRecorder> trace_recorder)
++      : models_(std::move(models)),
++        engine_config_(std::move(engine_config)),
++        trace_recorder_(std::move(trace_recorder)) {
++    TVM_FFI_ICHECK_EQ(models_.size(), 1U)
++        << "External K/V injection currently supports a single decode model only.";
++    TVM_FFI_ICHECK(models_[0]->GetMetadata().kv_state_kind == KVStateKind::kKVCache)
++        << "External K/V injection currently supports PagedKVCache models only.";
++  }
++
++  Array<Request> Step(EngineState estate) final {
++    if (estate->waiting_queue.empty() ||
++        !ContainsExternalKVData(estate->waiting_queue.front()->inputs)) {
++      return {};
++    }
++
++    auto it = estate->waiting_queue.begin();
++    Request request = *it;
++    const auto* request_external_kv = GetSoleExternalKVData(request->inputs);
++    TVM_FFI_ICHECK(request_external_kv != nullptr)
++        << "ExternalKVData requests must contain exactly one input: ExternalKVData.";
++    if (!estate->running_queue.empty()) {
++      // Keep the first version serialized with running decode requests. The injected prefix and
++      // replay tokens are then handed to BatchDecode in a predictable FIFO order.
++      return {};
++    }
++
++    RequestState rstate = estate->GetRequestState(request);
++    TVM_FFI_ICHECK_EQ(rstate->entries.size(), 1U)
++        << "External K/V injection does not support branched request state entries.";
++    RequestStateEntry rsentry = rstate->entries[0];
++    TVM_FFI_ICHECK(rsentry->status == RequestStateStatus::kPending)
++        << "External K/V injection expects a pending request state entry.";
++    TVM_FFI_ICHECK_EQ(rsentry->parent_idx, -1)
++        << "External K/V injection does not support prefix-cache fork/resume yet.";
++    TVM_FFI_ICHECK(rsentry->child_indices.empty())
++        << "External K/V injection does not support parallel child branches yet.";
++    TVM_FFI_ICHECK_EQ(rsentry->mstates.size(), 1U);
++    RequestModelState mstate = rsentry->mstates[0];
++    TVM_FFI_ICHECK(!mstate->inputs.empty());
++    const auto* external_kv = mstate->inputs[0].as<ExternalKVDataNode>();
++    TVM_FFI_ICHECK_NOTNULL(external_kv);
++    for (int i = 1; i < static_cast<int>(mstate->inputs.size()); ++i) {
++      TVM_FFI_ICHECK(mstate->inputs[i].as<TokenDataNode>() != nullptr)
++          << "External K/V rehydration only supports token replay inputs after ExternalKVData.";
++    }
++    TVM_FFI_ICHECK(external_kv == request_external_kv)
++        << "External K/V request state does not match the request input.";
++    TVM_FFI_ICHECK(estate->prefix_cache->Mode() == PrefixCacheMode::kDisable)
++        << "External K/V injection requires prefix_cache_mode=\"disable\" because the engine "
++           "does not have prompt token ids to register in the prefix cache.";
++    TVM_FFI_ICHECK_EQ(request->generation_cfg->n, 1)
++        << "External K/V injection currently supports n=1 only.";
++
++    int prefill_length = external_kv->prefill_length;
++    bool initial_injection = mstate->committed_tokens.empty();
++    int num_replay_tokens = initial_injection
++                                ? static_cast<int>(external_kv->decode_token_ids.size())
++                                : static_cast<int>(mstate->committed_tokens.size());
++    TVM_FFI_ICHECK_GT(prefill_length, 0);
++    TVM_FFI_ICHECK_GT(num_replay_tokens, 0);
++    if (initial_injection) {
++      for (int64_t token_id : external_kv->decode_token_ids) {
++        TVM_FFI_ICHECK_GE(token_id, std::numeric_limits<int32_t>::min());
++        TVM_FFI_ICHECK_LE(token_id, std::numeric_limits<int32_t>::max());
++      }
++    }
++
++    int required_pages = (prefill_length + engine_config_->kv_cache_page_size - 1) /
++                         engine_config_->kv_cache_page_size;
++    // BatchDecode will immediately append replay token(s), so keep those pages available.
++    required_pages += (num_replay_tokens + engine_config_->kv_cache_page_size - 1) /
++                      engine_config_->kv_cache_page_size;
++    while (models_[0]->GetNumAvailablePages() < required_pages) {
++      TVM_FFI_ICHECK(estate->prefix_cache->TryFreeMemory())
++          << "External K/V injection cannot reserve enough KV pages for prefill plus replay.";
++    }
++    TVM_FFI_ICHECK_LE(
++        models_[0]->GetCurrentTotalSequenceLength() + prefill_length + num_replay_tokens,
++        engine_config_->max_total_sequence_length)
++        << "External K/V injection would exceed max_total_sequence_length.";
++
++    auto tstart = std::chrono::high_resolution_clock::now();
++    {
++      NVTXScopedRange nvtx_scope("PDExternalKVPrefill inject request " + request->id);
++      RECORD_EVENT(trace_recorder_, request->id, "start external kv inject");
++
++      // After this point the action follows the existing fatal-check prefill contract. The first
++      // version does not attempt request-level rollback if AddNewSequence/DebugSetKV preconditions
++      // fail after engine state starts mutating.
++      rsentry->status = RequestStateStatus::kAlive;
++      estate->running_queue.push_back(request);
++
++      models_[0]->AddNewSequence(mstate->internal_id);
++      models_[0]->EnableSlidingWindowForSeq(mstate->internal_id);
++      models_[0]->DisaggPrepareKVRecv(mstate->internal_id, prefill_length);
++      models_[0]->DebugSetKV(mstate->internal_id, 0, external_kv->k_data, external_kv->v_data);
++
++      mstate->inputs.clear();
++      mstate->num_prefilled_tokens += prefill_length;
++      if (initial_injection) {
++        for (int64_t token_id : external_kv->decode_token_ids) {
++          mstate->CommitToken({{static_cast<int32_t>(token_id), 1.0f}, {}});
++        }
++        // Seed tokens are decode inputs, not generated deltas to stream back.
++        rsentry->next_callback_token_pos = static_cast<int>(mstate->committed_tokens.size());
++        if (request->generation_cfg->max_tokens != -1) {
++          ObjectPtr<GenerationConfigNode> updated_generation_cfg =
++              tvm::ffi::make_object<GenerationConfigNode>(*request->generation_cfg.get());
++          updated_generation_cfg->max_tokens += num_replay_tokens;
++          request->generation_cfg = GenerationConfig(updated_generation_cfg);
++        }
++        rstate->metrics.prefill_tokens += prefill_length;
++        rstate->metrics.prefill_end_time_point = std::chrono::high_resolution_clock::now();
++      } else {
++        mstate->num_tokens_for_next_decode = num_replay_tokens;
++      }
++      mstate->cached_committed_tokens = mstate->committed_tokens.size();
++
++      estate->waiting_queue.erase(it);
++      estate->running_rsentries_changed = true;
++      RECORD_EVENT(trace_recorder_, request->id, "finish external kv inject");
++    }
++    auto tend = std::chrono::high_resolution_clock::now();
++    estate->metrics.engine_prefill_time_sum += static_cast<double>((tend - tstart).count()) / 1e9;
++
++    // Return no processed request so BatchDecode runs in the same Engine::Step.
++    return {};
++  }
++
++ private:
++  Array<Model> models_;
++  EngineConfig engine_config_;
++  Optional<EventTraceRecorder> trace_recorder_;
++};
++
++EngineAction EngineAction::PDExternalKVPrefill(Array<Model> models, EngineConfig engine_config,
++                                               Optional<EventTraceRecorder> trace_recorder) {
++  return EngineAction(tvm::ffi::make_object<PDExternalKVPrefillActionObj>(
++      std::move(models), std::move(engine_config), std::move(trace_recorder)));
++}
++
++}  // namespace serve
++}  // namespace llm
++}  // namespace mlc

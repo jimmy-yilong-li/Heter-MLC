@@ -1,0 +1,199 @@
+diff --git a/src/runtime/vm/paged_kv_cache.cc b/src/runtime/vm/paged_kv_cache.cc
+index c2b30d0b0..a2a9f7b10 100644
+--- a/src/runtime/vm/paged_kv_cache.cc
++++ b/src/runtime/vm/paged_kv_cache.cc
+@@ -1264,6 +1264,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
+         << "Need at least one token to prefill";
+     std::vector<int32_t> trace = sequence->GetBlockTrace(global_block_pool_);
+     sequence->kv_transfer_metadata.local_position_map.reserve(sequence->seq_length - begin);
++    // This intentionally does not use BuildPhysicalPositionMap. Disagg send needs the tail
++    // window in reverse block order before reversing it back to the requested send order.
+     bool done = false;
+     for (auto it_block_id = trace.rbegin(); it_block_id != trace.rend(); ++it_block_id) {
+       const Block& block = global_block_pool_[*it_block_id];
+@@ -1614,6 +1616,49 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
+     return q_rope_position_map_view_;
+   };
+ 
++  /*!
++   * \brief Build the full logical-token to physical-page position map for debug KV I/O.
++   *
++   * The sink/sliding-window offset formula here is the single source of truth shared by
++   * DebugGetKV, DebugGetKVMLA, and DebugSetKV. The returned vector has one entry per logical
++   * token in the sequence, and each entry is a flattened physical slot
++   * `page_id * page_size + page_offset`.
++   */
++  std::vector<int32_t> BuildPhysicalPositionMap(const Sequence& seq) const {
++    std::vector<int32_t> trace = seq.GetBlockTrace(global_block_pool_);
++    std::vector<int32_t> position_map;
++    position_map.reserve(seq.seq_length);
++    for (int32_t block_id : trace) {
++      const Block& block = global_block_pool_[block_id];
++      for (int i = 0; i < block.seq_length; ++i) {
++        int32_t offset =
++            i < block.sink_length ? i : i - block.sink_length + block.sliding_window_offset;
++        int page_id = block.page_ids[offset / page_size_];
++        int page_offset = offset % page_size_;
++        position_map.push_back(page_id * page_size_ + page_offset);
++      }
++    }
++    TVM_FFI_ICHECK_EQ(static_cast<int64_t>(position_map.size()), seq.seq_length);
++    return position_map;
++  }
++
++  /*!
++   * \brief Copy a contiguous logical-token window from a host position map to the cache device.
++   *
++   * The window is expressed in logical token positions. Bounds are checked on host before the
++   * auxiliary tensor is created on `device_`.
++   */
++  Tensor CopyPositionMapWindowToDevice(const std::vector<int32_t>& position_map, int64_t start_pos,
++                                       int64_t length) const {
++    TVM_FFI_ICHECK_GE(start_pos, 0);
++    TVM_FFI_ICHECK_GE(length, 0);
++    TVM_FFI_ICHECK_LE(start_pos + length, static_cast<int64_t>(position_map.size()));
++    Tensor position_map_device = Tensor::Empty({length}, dtype_aux_, device_);
++    position_map_device.CopyFromBytes(position_map.data() + start_pos,
++                                      length * ((dtype_aux_.bits * dtype_aux_.lanes + 7) / 8));
++    return position_map_device;
++  }
++
+   void DebugGetKV(int64_t seq_id, int64_t start_pos, int64_t end_pos, Tensor k_data,
+                   Tensor v_data) final {
+     TVM_FFI_ICHECK(f_debug_get_kv_.defined())
+@@ -1643,23 +1688,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
+           << error_msg << " The number of head features mismatches.";
+     }
+ 
+-    std::vector<int32_t> trace = seq.GetBlockTrace(global_block_pool_);
+-    std::vector<int32_t> append_position_map;
+-    append_position_map.reserve(seq.seq_length);
+-    for (int32_t block_id : trace) {
+-      const Block& block = global_block_pool_[block_id];
+-      for (int i = 0; i < block.seq_length; ++i) {
+-        int32_t offset =
+-            i < block.sink_length ? i : i - block.sink_length + block.sliding_window_offset;
+-        int page_id = block.page_ids[offset / page_size_];
+-        int page_offset = offset % page_size_;
+-        append_position_map.push_back(page_id * page_size_ + page_offset);
+-      }
+-    }
+-    Tensor position_map_device = Tensor::Empty({end_pos - start_pos}, dtype_aux_, device_);
+-    position_map_device.CopyFromBytes(
+-        append_position_map.data() + start_pos,
+-        (end_pos - start_pos) * ((dtype_aux_.bits * dtype_aux_.lanes + 7) / 8));
++    std::vector<int32_t> position_map = BuildPhysicalPositionMap(seq);
++    Tensor position_map_device =
++        CopyPositionMapWindowToDevice(position_map, start_pos, end_pos - start_pos);
+     for (int64_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
+       TVM_FFI_ICHECK(attn_kinds_[layer_id] == AttnKind::kMHA)
+           << "Only MHA is supported for DebugGetKV";
+@@ -1689,23 +1720,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
+     TVM_FFI_ICHECK_EQ(kv_data->shape[2], qk_head_dim_)
+         << error_msg << " The number of head features mismatches.";
+ 
+-    std::vector<int32_t> trace = seq.GetBlockTrace(global_block_pool_);
+-    std::vector<int32_t> append_position_map;
+-    append_position_map.reserve(seq.seq_length);
+-    for (int32_t block_id : trace) {
+-      const Block& block = global_block_pool_[block_id];
+-      for (int i = 0; i < block.seq_length; ++i) {
+-        int32_t offset =
+-            i < block.sink_length ? i : i - block.sink_length + block.sliding_window_offset;
+-        int page_id = block.page_ids[offset / page_size_];
+-        int page_offset = offset % page_size_;
+-        append_position_map.push_back(page_id * page_size_ + page_offset);
+-      }
+-    }
+-    Tensor position_map_device = Tensor::Empty({end_pos - start_pos}, dtype_aux_, device_);
+-    position_map_device.CopyFromBytes(
+-        append_position_map.data() + start_pos,
+-        (end_pos - start_pos) * ((dtype_aux_.bits * dtype_aux_.lanes + 7) / 8));
++    std::vector<int32_t> position_map = BuildPhysicalPositionMap(seq);
++    Tensor position_map_device =
++        CopyPositionMapWindowToDevice(position_map, start_pos, end_pos - start_pos);
+     for (int64_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
+       TVM_FFI_ICHECK(attn_kinds_[layer_id] == AttnKind::kMLA)
+           << "Only MHA is supported for DebugGetKVMLA";
+@@ -1748,7 +1765,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
+     int64_t length = k_data->shape[1];
+ 
+     const Sequence& seq = seq_map_.at(seq_id);
+-    TVM_FFI_ICHECK_GE(start_pos, 0) << "DebugSetKV does not accept negative start_pos " << start_pos;
++    TVM_FFI_ICHECK_GE(start_pos, 0)
++        << "DebugSetKV does not accept negative start_pos " << start_pos;
+     TVM_FFI_ICHECK_GT(length, 0) << "DebugSetKV does not accept empty K/V data";
+     TVM_FFI_ICHECK_LE(start_pos + length, seq.seq_length)
+         << "DebugSetKV does not accept out-of-range [start_pos, start_pos + length). The sequence "
+@@ -1756,22 +1774,8 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
+ 
+     // Build the physical slot (page_id * page_size + page_offset) for each in-sequence position,
+     // identical to DebugGetKV, then keep the [start_pos, start_pos + length) window.
+-    std::vector<int32_t> trace = seq.GetBlockTrace(global_block_pool_);
+-    std::vector<int32_t> append_position_map;
+-    append_position_map.reserve(seq.seq_length);
+-    for (int32_t block_id : trace) {
+-      const Block& block = global_block_pool_[block_id];
+-      for (int i = 0; i < block.seq_length; ++i) {
+-        int32_t offset =
+-            i < block.sink_length ? i : i - block.sink_length + block.sliding_window_offset;
+-        int page_id = block.page_ids[offset / page_size_];
+-        int page_offset = offset % page_size_;
+-        append_position_map.push_back(page_id * page_size_ + page_offset);
+-      }
+-    }
+-    Tensor position_map_device = Tensor::Empty({length}, dtype_aux_, device_);
+-    position_map_device.CopyFromBytes(append_position_map.data() + start_pos,
+-                                      length * ((dtype_aux_.bits * dtype_aux_.lanes + 7) / 8));
++    std::vector<int32_t> position_map = BuildPhysicalPositionMap(seq);
++    Tensor position_map_device = CopyPositionMapWindowToDevice(position_map, start_pos, length);
+ 
+     // Scatter each layer's K/V slice into pages via the standard append kernel.
+     //
+diff --git a/tests/python/relax/test_runtime_builtin_paged_attention_kv_cache_debug_set_kv.py b/tests/python/relax/test_runtime_builtin_paged_attention_kv_cache_debug_set_kv.py
+index 97c727cd6..a8ef608f6 100644
+--- a/tests/python/relax/test_runtime_builtin_paged_attention_kv_cache_debug_set_kv.py
++++ b/tests/python/relax/test_runtime_builtin_paged_attention_kv_cache_debug_set_kv.py
+@@ -224,6 +224,42 @@ def test_debug_set_kv_round_trip(cfg):
+     np.testing.assert_array_equal(v_out.numpy(), v_ref_np)
+ 
+ 
++def test_debug_set_kv_rejects_cache_dtype_mismatch():
++    """DebugSetKV should fail loudly when external K/V dtype differs from the cache dtype."""
++    num_layers = 2
++    length = 16
++    cache_dtype = "float16"
++    kv_dtype = "float32"
++    num_qo_heads = 8
++    num_kv_heads = 4
++    head_dim = 64
++
++    builts = _build_kernels(num_layers, num_qo_heads, num_kv_heads, head_dim, cache_dtype)
++    cache = _create_kv_cache(
++        num_layers, num_qo_heads, num_kv_heads, head_dim, cache_dtype, builts
++    )
++
++    fadd_sequence = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
++    fbegin_forward = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
++    fend_forward = tvm.get_global_func("vm.builtin.kv_state_end_forward")
++    fset_kv = tvm.get_global_func("vm.builtin.attention_kv_cache_debug_set_kv")
++
++    seq_id = 0
++    fadd_sequence(cache, seq_id)
++    fbegin_forward(cache, tvm_ffi.Shape([seq_id]), tvm_ffi.Shape([length]))
++    fend_forward(cache)
++
++    k_bad = tvm.runtime.empty(
++        (num_layers, length, num_kv_heads, head_dim), kv_dtype, device=device
++    )
++    v_bad = tvm.runtime.empty(
++        (num_layers, length, num_kv_heads, head_dim), kv_dtype, device=device
++    )
++
++    with pytest.raises(Exception, match="DebugSetKV expects K/V dtype to match the cache dtype"):
++        fset_kv(cache, seq_id, 0, k_bad, v_bad)
++
++
+ def test_debug_set_kv_chunked_start_pos(cfg):
+     """Inject K/V in two chunks: [0, s) at start_pos=0, then [s, L) at start_pos=s>0.
+ 

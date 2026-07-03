@@ -1,0 +1,26 @@
+# Track only the public Heter-MLC package by default.
+*
+
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/logo.png
+!/patches/
+!/patches/*.patch
+
+# Local/system files.
+.DS_Store
+**/.DS_Store
+CLAUDE.md
+
+# Local checkouts and internal working notes.
+/mlc-llm/
+/tvm/
+/docs/
+/lessons/
+/review/
+/scratch/
+/scripts/
+/progress.md
+/status.md
+/env.sh
