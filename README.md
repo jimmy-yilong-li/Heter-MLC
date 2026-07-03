@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="Heter-MLC project logo" width="180">
+  <img src="logo.png" width="600">
 </p>
 
 # Heter-MLC
