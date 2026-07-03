@@ -2,16 +2,20 @@
 *
 
 !/.gitignore
-!/.gitattributes
 !/README.md
 !/logo.png
-!/patches/
-!/patches/*.patch
+!/src/
+!/src/**
+!/examples/
+!/examples/**
 
 # Local/system files.
 .DS_Store
 **/.DS_Store
 CLAUDE.md
+__pycache__/
+**/__pycache__/
+*.pyc
 
 # Local checkouts and internal working notes.
 /mlc-llm/

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" width="600">
+  <img src="./logo.png" alt="Heter-MLC project logo" width="260">
 </p>
 
 # Heter-MLC
@@ -26,13 +26,15 @@ serving.
 
 ## MLC Integration
 
-Heter-MLC references an external MLC-LLM checkout instead of vendoring MLC
-source. The current MLC integration is published as patch files:
+Heter-MLC references an external MLC-LLM checkout instead of vendoring a full
+MLC source tree. The integration code in this repository is laid out as an
+overlay for MLC-LLM:
 
-- `patches/mlc-llm-pd-engine-action.patch`
-  Apply from the root of an MLC-LLM checkout.
-- `patches/tvm-debug-set-kv.patch`
-  Apply from MLC's bundled `3rdparty/tvm` subtree.
+- `src/mlc-llm/cpp/...` contains the serving-engine integration.
+- `src/mlc-llm/python/...` contains the Python serving API integration.
+- `src/mlc-llm/3rdparty/tvm/...` contains the bundled runtime/cache updates
+  used by MLC.
+- `examples/qwen3_engine_external_kv_pd.py` is the engine-level smoke driver.
 
 Example layout:
 
@@ -40,15 +42,12 @@ Example layout:
 git clone https://github.com/mlc-ai/mlc-llm.git
 git clone https://github.com/YOUR_ORG/Heter-MLC.git
 
-cd mlc-llm/3rdparty/tvm
-git apply ../../../Heter-MLC/patches/tvm-debug-set-kv.patch
-
-cd ../..
-git apply ../Heter-MLC/patches/mlc-llm-pd-engine-action.patch
+rsync -a Heter-MLC/src/mlc-llm/ mlc-llm/
+cp Heter-MLC/examples/qwen3_engine_external_kv_pd.py .
 ```
 
-The patches are generated from the current development branches and may require
-rebasing if upstream MLC-LLM has moved.
+The overlay mirrors the target paths in an MLC-LLM checkout. If upstream MLC
+moves, rebase the overlay against the new checkout before using it.
 
 ## Current Progress
 
