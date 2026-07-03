@@ -71,7 +71,9 @@ Issues or a GitHub Project. The immediate items are:
 
 - Add engine-action mock tests for `PDExternalKVPrefill`.
 - Build a variable-length CoreML/ANE K/V producer.
-- Run longer-sequence latency sweeps.
-- Decide the stable public API name for the K/V injection primitive.
-- Add deeper logit/KV-difference validation once sampler-side reporting is
-  suitable.
+- Integrate external-KV requests with MLC's prefix-cache path once the producer
+  supplies a stable prefix identity or prompt-token record.
+- Run longer-sequence latency sweeps to prioritize zero-copy handoff,
+  injection-kernel optimization, and page-size tuning.
+- Decide the stable public API name for the K/V injection primitive and add
+  deeper validation once sampler-side reporting is suitable.
