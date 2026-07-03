@@ -2,7 +2,7 @@
   <img src="./logo_HeteroMLC.png" alt="Heter-MLC project logo" width="260">
 </p>
 
-# Heter-MLC
+# Hetero-MLC
 
 Heter-MLC is an open-source project for heterogeneous prefill/decode (PD) split
 serving on top of **MLC-LLM**. It extends the MLC serving path so prefill can be
