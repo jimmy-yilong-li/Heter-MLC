@@ -56,6 +56,7 @@ development path:
 
 - MLC-LLM build passes.
 - `DebugSetKV` tests pass.
+- `PDExternalKVPrefill` C++ mock-action tests pass.
 - Engine-level external-KV smoke passes on Qwen3-0.6B with exact two-token
   parity against a VM reference continuation.
 
@@ -69,7 +70,6 @@ Detailed planning is tracked outside this public package during early
 development. For the public repo, the next work should be tracked as GitHub
 Issues or a GitHub Project. The immediate items are:
 
-- Add engine-action mock tests for `PDExternalKVPrefill`.
 - Build a variable-length CoreML/ANE K/V producer.
 - Integrate external-KV requests with MLC's prefix-cache path once the producer
   supplies a stable prefix identity or prompt-token record.
